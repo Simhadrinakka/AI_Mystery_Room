@@ -2,14 +2,68 @@
 
 Create fictional detective cases from a scenario, inspect evidence, and submit one accusation.
 
-## Setup
+## Run locally
 
 1. Install Node.js 20+, npm, and MongoDB (local or Atlas).
-2. Run `npm install` at the repository root.
-3. Run `npm install` in `server` and `client`.
-4. Copy `.env.example` to `server/.env` and configure MongoDB, JWT, and Gemini credentials.
-5. Create `client/.env` with `VITE_API_URL=http://localhost:5000/api/v1`.
-6. Run `npm run seed:demo` in the root for a no-key demo case.
-7. Run `npm run dev` and open http://localhost:5173.
+2. Run `npm run install:all` from the repository root.
+3. Copy `server/.env.example` to `server/.env` and set MongoDB and Gemini credentials. Use a long random `JWT_SECRET`.
+4. Run `npm run seed:demo` if you want the no-key demo case.
+5. Run `npm run dev` and open http://localhost:5173.
 
-Gemini model IDs are configurable through `GEMINI_TEXT_MODEL` and `GEMINI_IMAGE_MODEL`. Generated image files are stored under `server/uploads` in development. Cases, people, and evidence are AI-generated fiction.
+The Vite development server proxies `/api/v1` and `/uploads` to Express. In production, Express serves the built client and API from one origin. Production evidence images are stored in MongoDB Atlas GridFS; development images are stored under `server/uploads`.
+
+## Deploy to Render + MongoDB Atlas
+
+This repository includes a Render Blueprint in `render.yaml`. It deploys the frontend and API as one Node web service. The same-origin setup keeps the authentication cookie first-party, and production image uploads persist in Atlas GridFS.
+
+### 1. Prepare MongoDB Atlas
+
+1. Create a MongoDB Atlas project and cluster.
+2. Under **Database Access**, create a database user and save its password.
+3. Under **Network Access**, add the Render service's outbound IP CIDR ranges. After creating the Render service, find them in **Render → service → Connect → Outbound**. If you need to deploy before you can add those ranges, use `0.0.0.0/0` only temporarily, then replace it with the Render ranges before putting real user data in the app.
+4. In Atlas, choose **Connect → Drivers** and copy the Node.js connection string. Replace the password placeholder with the database user's password and set the database name to `ai-mystery-room`.
+
+Atlas accepts connections only from addresses in its IP access list. A `0.0.0.0/0` entry permits access from anywhere, so prefer Render's service egress ranges and remove any temporary broad entry. See [Atlas IP access lists](https://www.mongodb.com/docs/atlas/security/ip-access-list/) and [Render outbound IP addresses](https://render.com/docs/outbound-ip-addresses).
+
+### 2. Push the project to GitHub
+
+1. Create a private GitHub repository and push this project to it.
+2. Confirm `.env`, `server/.env`, and `client/.env` are ignored. Never commit API keys, database credentials, or `.env` files.
+
+### 3. Create the Render service
+
+1. Sign in to Render and choose **New → Blueprint**.
+2. Connect the GitHub repository and select the branch to deploy. Render reads `render.yaml` and creates one web service.
+3. When asked for secret values, provide `MONGODB_URI` from Atlas and your Gemini API key as `GEMINI_API_KEY`. Keep the generated `JWT_SECRET`; do not reuse a development secret.
+4. The Blueprint builds the client and server, starts Express, and checks `/api/v1/health`. Wait for the first deploy to finish.
+5. If the first deploy cannot connect to Atlas, add the Render outbound IP ranges to Atlas Network Access, then redeploy from Render.
+
+The service runs the frontend and API on the same `https://<service>.onrender.com` origin; no `VITE_API_URL` setting is needed in production. Render's free web services spin down after 15 minutes idle and can take about a minute to wake. Use a paid instance if you need it continuously available. Free instances also have an ephemeral local filesystem, which is why production images are stored in Atlas instead. See [Render's free instance limits](https://render.com/docs/free).
+
+### 4. Seed the demo case (optional)
+
+From your computer, run the seed script with the production MongoDB URI and `NODE_ENV=production` set in the shell. This stores the demo images in Atlas GridFS. Alternatively, skip the demo; users can still create cases after `GEMINI_API_KEY` is configured.
+
+Do not paste credentials into shell commands that may be saved in terminal history. For a one-time seed, use a temporary environment loaded from a protected local file, then remove that temporary file when finished.
+
+### 5. Verify the deployment
+
+1. Open `https://<service>.onrender.com/api/v1/health`; it should return `{"status":"ok"}`.
+2. Open the service root; the landing page should load over HTTPS.
+3. Register an account, generate a case, view its evidence, and make an accusation.
+4. Check Render logs if the health check fails. Confirm `MONGODB_URI`, `GEMINI_API_KEY`, and Atlas Network Access are set correctly.
+
+### Environment variables
+
+Set these in Render's service environment settings (the Blueprint marks secrets as private):
+
+| Variable | Value |
+| --- | --- |
+| `NODE_ENV` | `production` |
+| `MONGODB_URI` | Atlas driver connection string |
+| `JWT_SECRET` | Generated by Render; keep it private |
+| `GEMINI_API_KEY` | Gemini API key; keep it private |
+| `GEMINI_TEXT_MODEL` | Defaults to `gemini-3.8-flash` |
+| `GEMINI_IMAGE_MODEL` | Defaults to `gemini-nano-banana-2.1` |
+
+Cases, people, and evidence are AI-generated fiction. Gemini model IDs can be changed with the two model environment variables.

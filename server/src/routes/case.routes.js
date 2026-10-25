@@ -10,6 +10,7 @@ import { calculateScore } from '../services/scoring.service.js';
 import { toPublicCase } from '../utils/serializers.js';
 import { hintPrompt } from '../prompts/hint.prompt.js';
 import { feedbackPrompt } from '../prompts/verdict.prompt.js';
+import { deleteStoredImages } from '../services/storage.service.js';
 const router = Router();
 router.use(requireAuth);
 const createLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 5, keyGenerator: req => String(req.user._id), standardHeaders: true, legacyHeaders: false });
@@ -42,5 +43,5 @@ router.post('/:id/accuse', validate(accuseSchema), asyncRoute(async (req, res) =
   c.accusation = { suspectId: req.body.suspectId, reasoning: req.body.reasoning, submittedAt: new Date(), isCorrect, score }; c.verdict = verdict; c.status = 'solved'; await c.save(); res.json(verdict);
 }));
 router.post('/:id/regenerate', asyncRoute(async (req, res) => { const c = await Case.findOne({ _id: objectIdSchema.parse(req.params.id), userId: req.user._id }); if (!c) return res.status(404).json({ error: { code: 'CASE_NOT_FOUND', message: 'Case not found.' } }); if (c.status !== 'failed') return res.status(409).json({ error: { code: 'NOT_FAILED', message: 'Only failed cases can be regenerated.' } }); c.status = 'generating'; c.errorMessage = undefined; c.generationProgress = { stage: 'queued', percent: 0, message: 'Retrying case generation' }; await c.save(); setImmediate(() => generateCase(c._id)); res.status(202).json({ caseId: c.id }); }));
-router.delete('/:id', asyncRoute(async (req, res) => { const c = await Case.findOneAndDelete({ _id: objectIdSchema.parse(req.params.id), userId: req.user._id }); if (!c) return res.status(404).json({ error: { code: 'CASE_NOT_FOUND', message: 'Case not found.' } }); res.status(204).end(); }));
+router.delete('/:id', asyncRoute(async (req, res) => { const c = await Case.findOne({ _id: objectIdSchema.parse(req.params.id), userId: req.user._id }); if (!c) return res.status(404).json({ error: { code: 'CASE_NOT_FOUND', message: 'Case not found.' } }); await deleteStoredImages(c); await c.deleteOne(); res.status(204).end(); }));
 export default router;

@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: ai-mystery-room
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm --prefix server ci && npm --prefix client ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: MONGODB_URI
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_TEXT_MODEL
+        value: gemini-3.8-flash
+      - key: GEMINI_IMAGE_MODEL
+        value: gemini-nano-banana-2.1
