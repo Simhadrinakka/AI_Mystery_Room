@@ -1,0 +1,46 @@
+import { Router } from 'express';
+import { rateLimit } from 'express-rate-limit';
+import Case from '../models/Case.js';
+import { requireAuth } from '../middleware/auth.js';
+import { validate } from '../middleware/validate.js';
+import { accuseSchema, createCaseSchema, notesSchema, objectIdSchema } from '../schemas/api.schemas.js';
+import { classifyScenario, generateText } from '../services/gemini.service.js';
+import { generateCase } from '../services/caseGenerator.service.js';
+import { calculateScore } from '../services/scoring.service.js';
+import { toPublicCase } from '../utils/serializers.js';
+import { hintPrompt } from '../prompts/hint.prompt.js';
+import { feedbackPrompt } from '../prompts/verdict.prompt.js';
+const router = Router();
+router.use(requireAuth);
+const createLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 5, keyGenerator: req => String(req.user._id), standardHeaders: true, legacyHeaders: false });
+const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+const owned = async (req, res) => { const id = objectIdSchema.parse(req.params.id); const c = await Case.findOne({ _id: id, userId: req.user._id }); if (!c) { res.status(404).json({ error: { code: 'CASE_NOT_FOUND', message: 'Case not found.' } }); return null; } return c; };
+router.post('/', createLimiter, validate(createCaseSchema), asyncRoute(async (req, res) => {
+  const active = await Case.exists({ userId: req.user._id, status: 'generating' }); if (active) return res.status(429).json({ error: { code: 'CASE_GENERATING', message: 'Wait for your current case to finish generating.' } });
+  const moderation = await classifyScenario(req.body.scenario);
+  if (!moderation.allowed) return res.status(422).json({ error: { code: 'SCENARIO_REJECTED', message: moderation.reason || 'Please choose a fictional, safe mystery scenario.' } });
+  const c = await Case.create({ userId: req.user._id, scenarioInput: req.body.scenario, difficulty: req.body.difficulty, tone: req.body.tone, status: 'generating', generationProgress: { stage: 'moderation', percent: 3, message: 'Preparing your mystery' } });
+  setImmediate(() => generateCase(c._id)); res.status(202).json({ caseId: c.id });
+}));
+router.get('/', asyncRoute(async (req, res) => { const rows = await Case.find({ userId: req.user._id }).sort({ createdAt: -1 }).select('title status difficulty createdAt accusation.score'); res.json({ cases: rows.map(c => ({ id: c.id, title: c.title, status: c.status, difficulty: c.difficulty, createdAt: c.createdAt, score: c.accusation?.score })) }); }));
+router.get('/:id/status', asyncRoute(async (req, res) => { const c = await owned(req, res); if (c) res.json({ status: c.status, generationProgress: c.generationProgress, errorMessage: c.errorMessage }); }));
+router.get('/:id', asyncRoute(async (req, res) => { const c = await owned(req, res); if (!c) return; if (c.status === 'generating') return res.json({ id: c.id, status: c.status, generationProgress: c.generationProgress }); res.json(toPublicCase(c)); }));
+router.patch('/:id/notes', validate(notesSchema), asyncRoute(async (req, res) => { const c = await owned(req, res); if (!c) return; c.notes = req.body.notes; if (req.body.pinnedEvidenceIds) c.pinnedEvidenceIds = req.body.pinnedEvidenceIds.filter(id => c.evidence.some(e => e.id === id)); await c.save(); res.json({ notes: c.notes, pinnedEvidenceIds: c.pinnedEvidenceIds }); }));
+router.post('/:id/evidence/:evidenceId/view', asyncRoute(async (req, res) => { const c = await owned(req, res); if (!c) return; if (!c.evidence.some(e => e.id === req.params.evidenceId)) return res.status(404).json({ error: { code: 'EVIDENCE_NOT_FOUND', message: 'Evidence not found.' } }); if (!c.viewedEvidenceIds.includes(req.params.evidenceId)) c.viewedEvidenceIds.push(req.params.evidenceId); await c.save(); res.json({ viewedEvidenceIds: c.viewedEvidenceIds }); }));
+router.post('/:id/hint', asyncRoute(async (req, res) => { const c = await Case.findOne({ _id: objectIdSchema.parse(req.params.id), userId: req.user._id }).select('+solution'); if (!c) return res.status(404).json({ error: { code: 'CASE_NOT_FOUND', message: 'Case not found.' } }); if (c.status !== 'ready') return res.status(409).json({ error: { code: 'CASE_NOT_READY', message: 'This case is not ready yet.' } }); if (c.hintsUsed >= 3) return res.status(429).json({ error: { code: 'HINT_LIMIT', message: 'You have used all three hints.' } }); const response = await generateText(hintPrompt({ solution: c.solution, level: c.hintsUsed + 1 })); let hint = typeof response === 'string' ? response : response.hint; const culprit = c.suspects.find(s => s.id === c.solution.culpritSuspectId); if (!hint || hint.toLowerCase().includes(String(c.solution.culpritSuspectId).toLowerCase()) || (culprit?.name && hint.toLowerCase().includes(culprit.name.toLowerCase()))) hint = 'Compare the times in the records with each suspect’s stated alibi. Look for a detail that could only be known by someone who was there.'; c.hintsUsed++; await c.save(); res.json({ hint, hintsUsed: c.hintsUsed }); }));
+router.post('/:id/accuse', validate(accuseSchema), asyncRoute(async (req, res) => {
+  const c = await Case.findOne({ _id: objectIdSchema.parse(req.params.id), userId: req.user._id }).select('+solution'); if (!c) return res.status(404).json({ error: { code: 'CASE_NOT_FOUND', message: 'Case not found.' } });
+  if (c.status !== 'ready' || c.accusation?.submittedAt) return res.status(409).json({ error: { code: 'ACCUSATION_CLOSED', message: 'This case has already been accused or is not ready.' } });
+  if (!c.suspects.some(s => s.id === req.body.suspectId)) return res.status(400).json({ error: { code: 'INVALID_SUSPECT', message: 'Choose a suspect from this case.' } });
+  const solution = c.solution; const isCorrect = req.body.suspectId === solution.culpritSuspectId;
+  const decisive = solution.evidenceClueMap.filter(x => !x.isRedHerring && x.incriminates === solution.culpritSuspectId);
+  const score = calculateScore({ isCorrect, difficulty: c.difficulty, hintsUsed: c.hintsUsed, decisiveEvidenceIds: decisive.map(x => x.evidenceId), viewedEvidenceIds: c.viewedEvidenceIds });
+  let reasoningFeedback = 'Your deduction has been compared with the evidence. Look at the timeline and the clues that distinguish motive from opportunity.';
+  try { const response = await generateText(feedbackPrompt({ reasoning: req.body.reasoning, solution })); reasoningFeedback = typeof response === 'string' ? response : response.feedback || response.reasoningFeedback || reasoningFeedback; } catch {}
+  const culprit = c.suspects.find(s => s.id === solution.culpritSuspectId);
+  const verdict = { isCorrect, culprit: { suspectId: solution.culpritSuspectId, name: culprit?.name }, motive: solution.motive, method: solution.method, timeline: solution.fullTimeline, decisiveEvidence: decisive.map(x => ({ evidenceId: x.evidenceId, explanation: x.clueRevealed })), redHerringExplanations: solution.redHerrings, reasoningFeedback, score };
+  c.accusation = { suspectId: req.body.suspectId, reasoning: req.body.reasoning, submittedAt: new Date(), isCorrect, score }; c.verdict = verdict; c.status = 'solved'; await c.save(); res.json(verdict);
+}));
+router.post('/:id/regenerate', asyncRoute(async (req, res) => { const c = await Case.findOne({ _id: objectIdSchema.parse(req.params.id), userId: req.user._id }); if (!c) return res.status(404).json({ error: { code: 'CASE_NOT_FOUND', message: 'Case not found.' } }); if (c.status !== 'failed') return res.status(409).json({ error: { code: 'NOT_FAILED', message: 'Only failed cases can be regenerated.' } }); c.status = 'generating'; c.errorMessage = undefined; c.generationProgress = { stage: 'queued', percent: 0, message: 'Retrying case generation' }; await c.save(); setImmediate(() => generateCase(c._id)); res.status(202).json({ caseId: c.id }); }));
+router.delete('/:id', asyncRoute(async (req, res) => { const c = await Case.findOneAndDelete({ _id: objectIdSchema.parse(req.params.id), userId: req.user._id }); if (!c) return res.status(404).json({ error: { code: 'CASE_NOT_FOUND', message: 'Case not found.' } }); res.status(204).end(); }));
+export default router;

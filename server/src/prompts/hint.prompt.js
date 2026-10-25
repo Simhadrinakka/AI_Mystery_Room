@@ -1,0 +1,1 @@
+export const hintPrompt = ({ solution, level }) => `Give progressive hint ${level}/3 for solving this case. Do not name the culprit. Point toward useful evidence or deduction. Ground truth: ${JSON.stringify(solution)}. Return JSON {"hint":"string"}.`;

@@ -1,0 +1,1 @@
+export const consistencyPrompt = ({ bible, evidence }) => `Check whether the evidence is consistent with this mystery and supports a fair deduction: ${JSON.stringify({ bible, evidence })}. Return JSON {consistent:boolean,issues:string[]}.`;

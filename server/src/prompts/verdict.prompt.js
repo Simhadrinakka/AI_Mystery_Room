@@ -1,0 +1,1 @@
+export const feedbackPrompt = ({ reasoning, solution }) => `In 2-4 constructive sentences, compare the player's reasoning (${reasoning}) with the actual deduction (${JSON.stringify(solution)}). Do not change the verdict. Return JSON {"feedback":"string"}.`;
